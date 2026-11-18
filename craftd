@@ -1,0 +1,1775 @@
+#!/usr/bin/env bash
+# craftd - simple PaperMC server management
+
+set -uo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+readonly DATA_DIR="/var/lib/craftd"
+readonly SERVERS_DIR="$DATA_DIR/servers"
+readonly CONFIG_DIR="$DATA_DIR/config"
+readonly SERVICE_USER="craftd"
+readonly SERVICE_GROUP="craftd"
+readonly API_URL="https://fill.papermc.io/v3/projects/paper"
+readonly USER_AGENT="craftd (https://github.com/ferranox/craftd)"
+
+API_PROJECT_FILE=""
+CONSOLE_PIPE=""
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+error() { printf 'Error: %s\n' "$*" >&2; }
+die() { error "$*"; exit 1; }
+
+cleanup() {
+    if [[ -n "$API_PROJECT_FILE" ]]; then
+        rm -f -- "$API_PROJECT_FILE" 2>/dev/null
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+have_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+require_deps() {
+    local missing=() dep
+    for dep in bash curl python3; do
+        command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+    done
+    ((${#missing[@]} == 0)) || die "Missing required tools: ${missing[*]}. Run the craftd installer to install them."
+}
+
+require_root() {
+    if ((EUID != 0)); then
+        die "This action changes system services. Run it with sudo (for example: sudo craftd $*)."
+    fi
+}
+
+require_systemd() {
+    have_systemd || die "craftd needs a running systemd instance to manage servers on this installation."
+}
+
+valid_name() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]
+}
+
+validate_name() {
+    valid_name "${1:-}" || die "Invalid server name. Use 1-32 lowercase letters, numbers, '-' or '_', starting with a letter or number."
+}
+
+config_file() { printf '%s/%s.conf' "$CONFIG_DIR" "$1"; }
+server_dir() { printf '%s/%s' "$SERVERS_DIR" "$1"; }
+server_unit() { printf 'craftd@%s.service' "$1"; }
+listener_unit() { printf 'craftd-listener@%s.service' "$1"; }
+
+server_exists() {
+    [[ -f "$(config_file "$1")" && -d "$(server_dir "$1")" ]]
+}
+
+acquire_config_lock() {
+    command -v flock >/dev/null 2>&1 || die "The 'flock' tool is required. Run the craftd installer to install it."
+    install -d -m 0755 "$DATA_DIR"
+    exec 8>"$DATA_DIR/.lock"
+    flock -x 8
+}
+
+load_config() {
+    local name="$1" file
+    validate_name "$name"
+    file="$(config_file "$name")"
+    [[ -f "$file" ]] || die "Server '$name' does not exist. Use 'craftd --list' to list servers."
+
+    NAME="" VERSION="" BUILD="" PORT="" MEMORY="" STARTUP="" ACCESS="" JAVA="" JAVA_MIN="8"
+    # Configuration files are root-owned and written using printf %q for paths.
+    # shellcheck disable=SC1090
+    source "$file"
+    NAME="$name"
+    [[ "$JAVA_MIN" =~ ^[0-9]+$ ]] || die "Invalid minimum Java version in $file."
+    [[ "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid Minecraft version in $file."
+    [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "Invalid port in $file."
+    [[ "$MEMORY" =~ ^[0-9]+$ && "$MEMORY" -ge 512 ]] || die "Invalid memory setting in $file."
+    [[ "$STARTUP" =~ ^(manual|always|automatic)$ ]] || die "Invalid startup behaviour in $file."
+    [[ "$ACCESS" =~ ^(private|public)$ ]] || die "Invalid accessibility setting in $file."
+    [[ -n "$JAVA" ]] || die "No Java executable is configured in $file."
+}
+
+write_config() {
+    local name="$1" tmp
+    tmp="$(mktemp "$CONFIG_DIR/.${name}.conf.XXXXXX")" || return 1
+    {
+        printf 'NAME=%q\n' "$NAME"
+        printf 'VERSION=%q\n' "$VERSION"
+        printf 'BUILD=%q\n' "$BUILD"
+        printf 'PORT=%q\n' "$PORT"
+        printf 'MEMORY=%q\n' "$MEMORY"
+        printf 'STARTUP=%q\n' "$STARTUP"
+        printf 'ACCESS=%q\n' "$ACCESS"
+        printf 'JAVA=%q\n' "$JAVA"
+        printf 'JAVA_MIN=%q\n' "$JAVA_MIN"
+    } >"$tmp"
+    chmod 0644 "$tmp"
+    chown root:"$SERVICE_GROUP" "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$(config_file "$name")"
+}
+
+list_server_names() {
+    local file name
+    shopt -s nullglob
+    for file in "$CONFIG_DIR"/*.conf; do
+        name="${file##*/}"
+        name="${name%.conf}"
+        valid_name "$name" && [[ -d "$(server_dir "$name")" ]] && printf '%s\n' "$name"
+    done
+    shopt -u nullglob
+}
+
+confirm() {
+    local message="$1" answer
+    read -r -p "$message [y/N]: " answer || return 1
+    [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+}
+
+ask_yes_no() {
+    local message="$1" default="$2" answer
+    read -r -p "$message" answer || answer=""
+    answer="${answer:-$default}"
+    [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+}
+
+choose_from_menu() {
+    local title="$1" default="$2" choice i
+    shift 2
+    local -a options=("$@")
+    printf '\n%s\n\n' "$title"
+    for i in "${!options[@]}"; do
+        printf '%d. %s\n' "$((i + 1))" "${options[i]}"
+    done
+    printf '\n'
+    while true; do
+        read -r -p "Select an option [1-${#options[@]}] (default $default): " choice || return 1
+        choice="${choice:-$default}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#options[@]})); then
+            SELECTED_OPTION="$choice"
+            return 0
+        fi
+        warn "Choose an option from 1 to ${#options[@]}."
+    done
+}
+
+get_property() {
+    local file="$1" key="$2" line
+    [[ -f "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s\n' "${line#*=}"
+            return 0
+        fi
+    done <"$file"
+    return 1
+}
+
+set_property() {
+    local file="$1" key="$2" value="$3" owner="$4" tmp line found=0 escaped
+    [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Invalid property name '$key'."
+    [[ -f "$file" ]] || die "Configuration file not found: $file"
+    escaped="$(python3 - "$value" <<'PY'
+import sys
+value = sys.argv[1].replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r").replace("\f", "\\f")
+# Java properties files treat leading spaces as insignificant unless escaped.
+leading = len(value) - len(value.lstrip(" "))
+if leading:
+    value = "\\ " * leading + value[leading:]
+print(value)
+PY
+)" || { error "Could not encode the property value."; return 1; }
+    value="$escaped"
+    tmp="$(mktemp "$DATA_DIR/.properties.XXXXXX")" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s=%s\n' "$key" "$value" >>"$tmp"
+            found=1
+        else
+            printf '%s\n' "$line" >>"$tmp"
+        fi
+    done <"$file"
+    ((found)) || printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+    chown "$owner" "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$file"
+}
+
+api_get() {
+    local url="$1" destination="$2"
+    curl -fLsS --connect-timeout 15 --max-time 90 --retry 2 \
+        -A "$USER_AGENT" "$url" -o "$destination"
+}
+
+fetch_project() {
+    if [[ -z "$API_PROJECT_FILE" ]]; then
+        API_PROJECT_FILE="$(mktemp)" || return 1
+        if ! api_get "$API_URL" "$API_PROJECT_FILE"; then
+            rm -f -- "$API_PROJECT_FILE"
+            API_PROJECT_FILE=""
+            error "Could not retrieve Minecraft versions from the official PaperMC API."
+            return 1
+        fi
+        if ! python3 - "$API_PROJECT_FILE" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+assert isinstance(data.get("versions"), dict)
+PY
+        then
+            error "PaperMC returned an invalid response. Please try again later."
+            return 1
+        fi
+    fi
+}
+
+latest_version() {
+    python3 - "$API_PROJECT_FILE" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(next(iter(data["versions"].values()))[0])
+PY
+}
+
+version_known() {
+    python3 - "$API_PROJECT_FILE" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+versions = {v for group in data["versions"].values() for v in group}
+sys.exit(0 if sys.argv[2] in versions else 1)
+PY
+}
+
+version_java_minimum() {
+    local version="$1" metadata
+    metadata="$(mktemp)" || return 1
+    if ! api_get "$API_URL/versions/$version" "$metadata"; then
+        rm -f -- "$metadata"
+        error "Could not retrieve requirements for Minecraft $version."
+        return 1
+    fi
+    python3 - "$metadata" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+minimum = int(data["version"]["java"]["version"]["minimum"])
+assert 8 <= minimum <= 99
+print(minimum)
+PY
+    local status=$?
+    rm -f -- "$metadata"
+    return "$status"
+}
+
+choose_version() {
+    local latest entered
+    fetch_project || return 1
+    latest="$(latest_version)" || return 1
+    info "Latest supported Minecraft version: $latest"
+    while true; do
+        read -r -p "Minecraft version [$latest]: " entered || return 1
+        entered="${entered:-$latest}"
+        if [[ "$entered" =~ ^[A-Za-z0-9._-]+$ ]] && version_known "$entered"; then
+            SELECTED_VERSION="$entered"
+            SELECTED_JAVA="$(version_java_minimum "$entered")" || return 1
+            [[ "$SELECTED_JAVA" =~ ^[0-9]+$ ]] || { error "Could not determine the Java version required by $entered."; return 1; }
+            return 0
+        fi
+        warn "'$entered' is not available from PaperMC. Try another version, or press Enter for the latest."
+    done
+}
+
+java_major() {
+    local executable="$1" output major
+    [[ -x "$executable" ]] || return 1
+    output="$("$executable" -version 2>&1)" || return 1
+    major="$(printf '%s\n' "$output" | sed -n '1s/.*version "1\.\([0-9][0-9]*\).*/\1/p')"
+    if [[ -z "$major" ]]; then
+        major="$(printf '%s\n' "$output" | sed -n '1s/.*version "\([0-9][0-9]*\).*/\1/p')"
+    fi
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$major"
+}
+
+find_java() {
+    local required="$1" candidate major best="" best_major=0
+    shopt -s nullglob
+    for candidate in /usr/lib/jvm/*/bin/java /opt/jdk*/bin/java "$DATA_DIR"/java/*/bin/java; do
+        [[ -x "$candidate" ]] || continue
+        major="$(java_major "$candidate")" || continue
+        if ((major >= required && (best_major == 0 || major < best_major))); then
+            best="$candidate"
+            best_major="$major"
+        fi
+    done
+    shopt -u nullglob
+    if candidate="$(command -v java 2>/dev/null)"; then
+        if major="$(java_major "$candidate")"; then
+            if ((major >= required && (best_major == 0 || major < best_major))); then
+                best="$candidate"
+            fi
+        fi
+    fi
+    [[ -n "$best" ]] || return 1
+    printf '%s\n' "$best"
+}
+
+package_manager() {
+    local manager
+    for manager in apt-get dnf yum pacman apk; do
+        if command -v "$manager" >/dev/null 2>&1; then
+            printf '%s\n' "$manager"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_package() {
+    local manager="$1" package="$2"
+    info "Installing $package..."
+    case "$manager" in
+        apt-get)
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq || return 1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$package" || return 1
+            ;;
+        dnf) dnf install -y "$package" || return 1 ;;
+        yum) yum install -y "$package" || return 1 ;;
+        pacman) pacman -Sy --noconfirm --needed "$package" || return 1 ;;
+        apk) apk add --no-cache "$package" || return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_adoptium_java() {
+    local required="$1" manager="$2" machine os arch url archive extract executable
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64) arch="x64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        armv7l|armv7) arch="arm" ;;
+        *) error "No automatic Java download is available for architecture $machine."; return 1 ;;
+    esac
+    if [[ "$manager" == "apk" ]]; then os="alpine-linux"; else os="linux"; fi
+    command -v tar >/dev/null 2>&1 || install_package "$manager" tar || return 1
+    if [[ "$manager" == "apt-get" ]]; then
+        command -v gzip >/dev/null 2>&1 || install_package "$manager" gzip || return 1
+    fi
+    install -d -m 0755 "$DATA_DIR/java"
+    archive="$(mktemp)" || return 1
+    extract="$(mktemp -d "$DATA_DIR/java/.install.XXXXXX")" || { rm -f "$archive"; return 1; }
+    url="https://api.adoptium.net/v3/binary/latest/${required}/ga/${os}/${arch}/jre/hotspot/normal/eclipse"
+    info "Installing Java $required from Eclipse Adoptium..." >&2
+    if ! curl -fLsS --connect-timeout 20 --max-time 600 --retry 2 -A "$USER_AGENT" "$url" -o "$archive"; then
+        rm -rf -- "$extract"; rm -f -- "$archive"
+        error "Could not download Java $required."
+        return 1
+    fi
+    if ! tar -xzf "$archive" -C "$extract"; then
+        rm -rf -- "$extract"; rm -f -- "$archive"
+        error "Could not unpack Java $required."
+        return 1
+    fi
+    rm -f -- "$archive"
+    executable="$(find "$extract" -type f -path '*/bin/java' -print -quit)"
+    if [[ -z "$executable" ]]; then
+        rm -rf -- "$extract"
+        error "The Java download did not contain a Java executable."
+        return 1
+    fi
+    local destination="$DATA_DIR/java/temurin-$required" java_root="${executable%/bin/java}"
+    rm -rf -- "$destination"
+    mkdir -p "$destination"
+    cp -a "$java_root"/. "$destination"/
+    rm -rf -- "$extract"
+    find_java "$required"
+}
+
+ensure_java() {
+    local required="$1" manager package installed
+    if installed="$(find_java "$required")"; then
+        FOUND_JAVA="$installed"
+        return 0
+    fi
+    manager="$(package_manager)" || { error "No supported package manager was found. Install Java $required and try again."; return 1; }
+    case "$manager" in
+        apt-get|dnf|yum) package="openjdk-${required}-jre-headless" ;;
+        pacman)
+            if pacman -Si "jre${required}-openjdk-headless" >/dev/null 2>&1; then
+                package="jre${required}-openjdk-headless"
+            else
+                package="jre-openjdk-headless"
+            fi
+            ;;
+        apk) package="openjdk${required}-jre" ;;
+    esac
+    if [[ "$manager" == "dnf" || "$manager" == "yum" ]]; then
+        package="java-${required}-openjdk-headless"
+    fi
+    if ! install_package "$manager" "$package"; then
+        warn "Java $required was not available from the system package manager; trying Eclipse Adoptium."
+        installed="$(install_adoptium_java "$required" "$manager")" || return 1
+        FOUND_JAVA="$installed"
+        return 0
+    fi
+    installed="$(find_java "$required")" || { error "Java $required was installed, but no compatible Java executable could be found."; return 1; }
+    FOUND_JAVA="$installed"
+}
+
+download_paper() {
+    local name="$1" version="$2" destination metadata info_file build url checksum filename tmp actual
+    destination="$(server_dir "$name")"
+    metadata="$(mktemp)" || return 1
+    info "Finding the latest stable Paper build for Minecraft $version..."
+    if ! api_get "$API_URL/versions/$version/builds?channel=STABLE" "$metadata"; then
+        rm -f -- "$metadata"
+        error "Could not retrieve Paper builds for Minecraft $version."
+        return 1
+    fi
+    info_file="$(mktemp)" || { rm -f -- "$metadata"; return 1; }
+    if ! python3 - "$metadata" >"$info_file" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    builds = json.load(f)
+if isinstance(builds, dict) and builds.get("ok") is False:
+    raise SystemExit(builds.get("message", "PaperMC returned an error"))
+build = next((b for b in builds if b.get("channel") == "STABLE"), None)
+if build is None:
+    raise SystemExit("No stable Paper build is available for this version")
+download = build["downloads"]["server:default"]
+print(int(build["id"]))
+print(download["url"])
+print(download["checksums"]["sha256"].lower())
+print(download["name"])
+PY
+    then
+        error "No stable PaperMC download is available for Minecraft $version."
+        rm -f -- "$metadata" "$info_file"
+        return 1
+    fi
+    {
+        IFS= read -r build
+        IFS= read -r url
+        IFS= read -r checksum
+        IFS= read -r filename
+    } <"$info_file"
+    rm -f -- "$metadata" "$info_file"
+    [[ "$build" =~ ^[0-9]+$ && "$checksum" =~ ^[0-9a-f]{64}$ && "$url" == https://* ]] || {
+        error "PaperMC returned invalid download information."
+        return 1
+    }
+    [[ "$filename" =~ ^[A-Za-z0-9._-]+$ ]] || filename="paper-$version-$build.jar"
+    tmp="$(mktemp "$DATA_DIR/.paper-download.XXXXXX")" || return 1
+    info "Downloading $filename..."
+    if ! curl -fLsS --connect-timeout 20 --max-time 900 --retry 3 \
+        -A "$USER_AGENT" "$url" -o "$tmp"; then
+        rm -f -- "$tmp"
+        error "The PaperMC download failed. Your existing server files were not changed."
+        return 1
+    fi
+    actual="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [[ "$actual" != "$checksum" ]]; then
+        rm -f -- "$tmp"
+        error "The PaperMC download failed its SHA-256 check. Your existing server files were not changed."
+        return 1
+    fi
+    chmod 0644 "$tmp"
+    chown "$SERVICE_USER:$SERVICE_GROUP" "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$destination/server.jar"
+    DOWNLOAD_BUILD="$build"
+    info "Paper $version (build $build) downloaded and verified."
+}
+
+default_memory() {
+    local total_mb
+    total_mb="$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)"
+    if ((total_mb < 1500)); then
+        printf '512\n'
+    elif ((total_mb < 3000)); then
+        printf '1024\n'
+    elif ((total_mb < 6000)); then
+        printf '2048\n'
+    elif ((total_mb < 12000)); then
+        printf '4096\n'
+    else
+        printf '8192\n'
+    fi
+}
+
+primary_ipv4() {
+    local address=""
+    if command -v ip >/dev/null 2>&1; then
+        address="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}')"
+    fi
+    if [[ ! "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        address="$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9.]+$/ {print; exit}')"
+    fi
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || address="127.0.0.1"
+    printf '%s\n' "$address"
+}
+
+port_configured() {
+    local port="$1" exclude="${2:-}" file name key value
+    shopt -s nullglob
+    for file in "$CONFIG_DIR"/*.conf; do
+        name="${file##*/}"; name="${name%.conf}"
+        [[ "$name" == "$exclude" ]] && continue
+        while IFS='=' read -r key value; do
+            if [[ "$key" == "PORT" ]]; then
+                value="${value%\'}"; value="${value#\'}"
+                [[ "$value" == "$port" ]] && { shopt -u nullglob; return 0; }
+            fi
+        done <"$file"
+    done
+    shopt -u nullglob
+    return 1
+}
+
+port_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        [[ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]]
+    else
+        return 1
+    fi
+}
+
+port_available() {
+    local port="$1" exclude="${2:-}"
+    [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1024 && "$port" -le 65535 ]] || return 1
+    ! port_configured "$port" "$exclude" && ! port_listening "$port"
+}
+
+next_port() {
+    local port=25565
+    while ((port <= 65535)); do
+        if port_available "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+        ((port += 1))
+    done
+    return 1
+}
+
+normalise_boolean() {
+    case "${1,,}" in
+        y|yes|true|on|1) printf 'true\n' ;;
+        n|no|false|off|0) printf 'false\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+service_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+service_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
+
+service_status() {
+    local name="$1" unit listener
+    unit="$(server_unit "$name")"
+    listener="$(listener_unit "$name")"
+    if service_active "$unit"; then
+        printf 'RUNNING\n'
+    elif systemctl is-failed --quiet "$unit" 2>/dev/null; then
+        printf 'FAILED\n'
+    elif service_active "$listener"; then
+        printf 'WAITING\n'
+    else
+        printf 'STOPPED\n'
+    fi
+}
+
+send_command() {
+    local name="$1" command="$2" pipe ready
+    pipe="$(server_dir "$name")/.craftd-console"
+    ready="$(server_dir "$name")/.craftd-ready"
+    if ! service_active "$(server_unit "$name")" || [[ ! -p "$pipe" ]]; then
+        error "Server '$name' is not running."
+        return 1
+    fi
+    if [[ ! -e "$ready" ]]; then
+        info "Waiting for server '$name' to finish starting..." >&2
+        for _ in {1..120}; do
+            [[ -e "$ready" ]] && break
+            if ! service_active "$(server_unit "$name")"; then
+                error "Server '$name' stopped while starting."
+                return 1
+            fi
+            sleep 1
+        done
+        if [[ ! -e "$ready" ]]; then
+            error "Server '$name' is still starting. Try again shortly."
+            return 1
+        fi
+    fi
+    python3 - "$pipe" "$command" <<'PY'
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.write(fd, (sys.argv[2] + "\n").encode())
+    finally:
+        os.close(fd)
+except OSError as exc:
+    print(f"Could not send the console command: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+run_server() {
+    local name="$1" dir java_pid rc stopping=0 actual_java ready_file ready_pid=0 watchdog_pid=0 log_file log_offset=0
+    load_config "$name"
+    dir="$(server_dir "$name")"
+    [[ -f "$dir/server.jar" ]] || die "Server JAR is missing for '$name'."
+    [[ -x "$JAVA" ]] || die "Configured Java executable is missing: $JAVA"
+    actual_java="$(java_major "$JAVA")" || die "The configured Java executable could not be run: $JAVA"
+    ((actual_java >= JAVA_MIN)) || die "Minecraft $VERSION needs Java $JAVA_MIN or newer, but $JAVA is Java $actual_java. Change the server version or reinstall its Java runtime."
+    cd "$dir" || die "Could not enter $dir."
+    umask 022
+    CONSOLE_PIPE="$dir/.craftd-console"
+    ready_file="$dir/.craftd-ready"
+    rm -f -- "$CONSOLE_PIPE" "$ready_file"
+    mkfifo -m 0600 "$CONSOLE_PIPE" || die "Could not create the server console pipe."
+    exec 9<>"$CONSOLE_PIPE" || die "Could not open the server console pipe."
+    trap 'if ((ready_pid)); then kill "$ready_pid" 2>/dev/null || true; fi; if ((watchdog_pid)); then kill "$watchdog_pid" 2>/dev/null || true; fi; rm -f -- "$CONSOLE_PIPE" "$ready_file"' EXIT
+    info "Starting craftd server '$NAME' (Minecraft $VERSION, Java $("$JAVA" -version 2>&1 | head -1))."
+    "$JAVA" -Xms512M "-Xmx${MEMORY}M" -jar server.jar nogui <&9 &
+    java_pid=$!
+    log_file="$dir/logs/latest.log"
+    if [[ -r "$log_file" ]]; then
+        log_offset="$(stat -c %s -- "$log_file" 2>/dev/null || printf '0')"
+    fi
+    (
+        offset="${log_offset:-0}"
+        while kill -0 "$java_pid" 2>/dev/null; do
+            if [[ -r "$log_file" ]]; then
+                size="$(stat -c %s -- "$log_file" 2>/dev/null || printf '0')"
+                if ((size < offset)); then offset=0; fi
+                if ((size > offset)) && tail -c "+$((offset + 1))" -- "$log_file" 2>/dev/null | grep -q 'Done ('; then
+                    : >"$ready_file"
+                    exit 0
+                fi
+                offset="$size"
+            fi
+            sleep 1
+        done
+    ) &
+    ready_pid=$!
+    # Retry the clean stop if Paper is still initialising; finally forward SIGTERM to Java.
+    trap 'if ((stopping == 0)); then stopping=1; printf "stop\n" >&9 2>/dev/null || true; (sleep 10; printf "stop\n" >&9 2>/dev/null || true; sleep 10; kill -TERM "$java_pid" 2>/dev/null || true) & watchdog_pid=$!; fi' TERM INT
+    while true; do
+        wait "$java_pid"
+        rc=$?
+        if ! kill -0 "$java_pid" 2>/dev/null; then
+            break
+        fi
+        if ((stopping)); then
+            continue
+        fi
+    done
+    if ((watchdog_pid)); then
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
+    exec 9>&-
+    rm -f -- "$CONSOLE_PIPE" "$ready_file"
+    exit "${rc:-0}"
+}
+
+start_server() {
+    local name="$1"
+    require_root --start "$name"
+    require_systemd
+    load_config "$name"
+    if service_active "$(server_unit "$name")"; then
+        info "Server '$name' is already running."
+        return 0
+    fi
+    if [[ "$STARTUP" == "automatic" ]]; then
+        systemctl stop "$(listener_unit "$name")" 2>/dev/null || true
+    fi
+    if ! systemctl start "$(server_unit "$name")"; then
+        error "Server '$name' failed to start. Check logs with: sudo craftd --logs $name"
+        systemctl --no-pager --full status "$(server_unit "$name")" 2>/dev/null | tail -20 >&2
+        [[ "$STARTUP" == "automatic" ]] && systemctl start "$(listener_unit "$name")" >/dev/null 2>&1 || true
+        return 1
+    fi
+    # Type=simple returns before Java has completed startup, but catch immediate failures.
+    sleep 1
+    if ! service_active "$(server_unit "$name")"; then
+        error "Server '$name' exited during startup. Check logs with: sudo craftd --logs $name"
+        [[ "$STARTUP" == "automatic" ]] && systemctl start "$(listener_unit "$name")" >/dev/null 2>&1 || true
+        return 1
+    fi
+    info "Server '$name' started. The world may still be loading; use 'sudo craftd --logs $name' to watch progress."
+}
+
+stop_server() {
+    local name="$1"
+    require_root --stop "$name"
+    require_systemd
+    load_config "$name"
+    if ! service_active "$(server_unit "$name")"; then
+        if [[ "$STARTUP" == "automatic" ]]; then
+            systemctl start "$(listener_unit "$name")" 2>/dev/null || true
+        fi
+        info "Server '$name' is already stopped."
+        return 0
+    fi
+    info "Stopping server '$name' cleanly..."
+    if ! systemctl stop "$(server_unit "$name")"; then
+        error "Server '$name' did not stop cleanly. Check: sudo systemctl status craftd@$name"
+        return 1
+    fi
+    info "Server '$name' stopped."
+}
+
+restart_server() {
+    local name="$1"
+    stop_server "$name" || return 1
+    start_server "$name"
+}
+
+resume_listener() {
+    local name="$1" result="${2:-success}" state system_state
+    ((EUID == 0)) || exit 0
+    # A failed service is about to be restarted by systemd; do not take its port.
+    [[ "$result" == "success" ]] || exit 0
+    valid_name "$name" || exit 0
+    server_exists "$name" || exit 0
+    [[ ! -e "$CONFIG_DIR/$name.update" ]] || exit 0
+    load_config "$name" || exit 0
+    [[ "$STARTUP" == "automatic" ]] || exit 0
+    system_state="$(systemctl is-system-running 2>/dev/null || true)"
+    [[ "$system_state" != "stopping" && "$system_state" != "offline" ]] || exit 0
+    # Give an explicit 'systemctl restart' time to enqueue its new start job.
+    sleep 2
+    state="$(systemctl show "$(server_unit "$name")" --property=ActiveState --value 2>/dev/null || true)"
+    [[ "$state" != "active" && "$state" != "activating" && "$state" != "reloading" ]] || exit 0
+    [[ ! -e "$CONFIG_DIR/$name.update" ]] || exit 0
+    systemctl start "$(listener_unit "$name")" 2>/dev/null || true
+}
+
+apply_startup() {
+    local name="$1" unit listener
+    unit="$(server_unit "$name")"
+    listener="$(listener_unit "$name")"
+    systemctl disable --now "$listener" >/dev/null 2>&1 || { error "Could not stop the automatic listener for '$name'."; return 1; }
+    case "$STARTUP" in
+        manual)
+            systemctl disable "$unit" >/dev/null 2>&1 || { error "Could not disable boot startup for '$name'."; return 1; }
+            info "Startup behaviour: manual. Start this server with 'sudo craftd --start $name'."
+            ;;
+        always)
+            if ! systemctl enable --now "$unit"; then
+                error "Could not start or enable '$name' at boot."
+                return 1
+            fi
+            info "Startup behaviour: always on. The server is running and will start at boot."
+            ;;
+        automatic)
+            systemctl disable "$unit" >/dev/null 2>&1 || { error "Could not disable direct boot startup for '$name'."; return 1; }
+            systemctl stop "$unit" >/dev/null 2>&1 || { error "Could not stop '$name' before enabling its listener."; return 1; }
+            if ! systemctl enable --now "$listener"; then
+                error "Could not enable the automatic connection listener for '$name'."
+                return 1
+            fi
+            info "Startup behaviour: automatic. The listener is active on port $PORT; a Minecraft connection will start the server."
+            info "The first connection may time out while the world loads. Reconnect shortly afterwards."
+            ;;
+    esac
+}
+
+run_listener() {
+    local name="$1"
+    ((EUID == 0)) || die "The automatic listener must run as a craftd system service."
+    load_config "$name"
+    exec python3 - "$name" "$PORT" "$CONFIG_DIR/$name.update" "$(server_dir "$name")/.craftd-ready" <<'PY'
+import os
+import select
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+name, port_text, update_marker, ready_marker = sys.argv[1:5]
+port = int(port_text)
+
+def make_listener():
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
+        sock.bind(("::", port))
+        return sock
+    except OSError:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", port))
+        return sock
+
+def start_minecraft():
+    if os.path.exists(update_marker):
+        raise RuntimeError("server maintenance is in progress")
+    result = subprocess.run(
+        ["systemctl", "start", f"craftd@{name}.service"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=None,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("systemd could not start the Minecraft service")
+
+def wait_until_ready():
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        if os.path.exists(ready_marker):
+            return
+        time.sleep(0.5)
+    raise TimeoutError("Minecraft did not finish starting within 180 seconds")
+
+def connect_minecraft(client, first_packet):
+    deadline = time.monotonic() + 180
+    upstream = None
+    while time.monotonic() < deadline:
+        try:
+            candidate = socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            if client.fileno() < 0:
+                raise
+            time.sleep(0.5)
+            continue
+        try:
+            candidate.settimeout(None)
+            candidate.sendall(first_packet)
+            # Paper opens its port shortly before it logs "Done" and drops
+            # connections that arrive during that final initialisation phase.
+            # Detect that immediate EOF and retry instead of failing the player.
+            readable, _, _ = select.select([candidate], [], [], 1.0)
+            if readable and candidate.recv(1, socket.MSG_PEEK) == b"":
+                candidate.close()
+                time.sleep(0.5)
+                continue
+        except OSError:
+            candidate.close()
+            time.sleep(0.5)
+            continue
+        upstream = candidate
+        break
+    if upstream is None:
+        raise TimeoutError("Minecraft did not finish starting within 180 seconds")
+    client.settimeout(None)
+    upstream.settimeout(None)
+
+    def copy_packets(source, destination):
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                destination.sendall(data)
+        except OSError as exc:
+            print(f"craftd: connection relay error: {exc}", file=sys.stderr, flush=True)
+        finally:
+            try:
+                destination.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    relay = threading.Thread(target=copy_packets, args=(upstream, client), daemon=True)
+    relay.start()
+    try:
+        copy_packets(client, upstream)
+        relay.join(timeout=10)
+    finally:
+        for sock in (client, upstream):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+if os.path.exists(update_marker):
+    sys.exit(0)
+already_running = subprocess.run(
+    ["systemctl", "is-active", "--quiet", f"craftd@{name}.service"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    check=False,
+).returncode
+if already_running == 0:
+    sys.exit(0)
+
+print(f"craftd: waiting for Minecraft connections on port {port}", flush=True)
+while True:
+    listener = make_listener()
+    listener.listen(8)
+    listener.settimeout(None)
+    try:
+        client, address = listener.accept()
+        client.settimeout(2)
+        try:
+            first_packet = client.recv(65536)
+        except socket.timeout:
+            client.close()
+            listener.close()
+            continue
+        if not first_packet:
+            client.close()
+            listener.close()
+            continue
+        print(f"craftd: connection from {address[0]} is starting {name}", flush=True)
+        listener.close()
+        try:
+            # Ignore a marker left by a hard-killed previous run; this wake must
+            # publish its own marker only after Paper logs that it is ready.
+            try:
+                os.unlink(ready_marker)
+            except OSError:
+                pass
+            start_minecraft()
+            wait_until_ready()
+        except Exception as exc:
+            print(f"craftd: automatic startup failed: {exc}", file=sys.stderr, flush=True)
+            client.close()
+            sys.exit(1)
+        try:
+            client.settimeout(None)
+            connect_minecraft(client, first_packet)
+        except Exception as exc:
+            # Minecraft is already active. Never restart the listener and fight it for the port.
+            print(f"craftd: automatic connection relay ended: {exc}", file=sys.stderr, flush=True)
+            client.close()
+        sys.exit(0)
+    except Exception:
+        listener.close()
+        raise
+PY
+}
+
+whitelist_add_offline() {
+    local name="$1" username="$2" dir props online uuid_response lookup_name uuid endpoint staging
+    [[ "$username" =~ ^[A-Za-z0-9_]{3,16}$ ]] || { error "Minecraft usernames must be 3-16 letters, numbers or underscores."; return 1; }
+    dir="$(server_dir "$name")"
+    if service_active "$(server_unit "$name")"; then
+        send_command "$name" "whitelist add $username" || return 1
+        for _ in {1..10}; do
+            if python3 - "$dir/whitelist.json" "$username" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        entries = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    entries = []
+sys.exit(0 if any(e.get("name", "").lower() == sys.argv[2].lower() for e in entries) else 1)
+PY
+            then
+                info "Added '$username' to the whitelist."
+                return 0
+            fi
+            sleep 1
+        done
+        error "The server did not confirm '$username'. Check the username and server console, then try again."
+        return 1
+    fi
+    props="$dir/server.properties"
+    online="$(get_property "$props" online-mode || printf 'true')"
+    if [[ "$online" == "true" ]]; then
+        uuid_response="$(mktemp)" || return 1
+        endpoint="https://api.mojang.com/users/profiles/minecraft/$username"
+        if ! curl -fLsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 --retry-all-errors -A "$USER_AGENT" "$endpoint" -o "$uuid_response"; then
+            rm -f -- "$uuid_response"
+            error "Could not look up '$username'. Check the spelling or try again when the Minecraft account service is available."
+            return 1
+        fi
+        if ! lookup_name="$(python3 - "$uuid_response" <<'PY'
+import json, sys, uuid
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(data["name"])
+print(str(uuid.UUID(data["id"])))
+PY
+        )"; then
+            rm -f -- "$uuid_response"
+            error "Mojang returned invalid account information for '$username'."
+            return 1
+        fi
+        rm -f -- "$uuid_response"
+        username="$(printf '%s\n' "$lookup_name" | head -1)"
+        uuid="$(printf '%s\n' "$lookup_name" | tail -1)"
+    else
+        uuid="$(python3 - "$username" <<'PY'
+import hashlib, sys, uuid
+value = hashlib.md5(("OfflinePlayer:" + sys.argv[1]).encode("utf-8")).digest()
+print(uuid.UUID(bytes=value, version=3))
+PY
+)"
+    fi
+    staging="$(mktemp "$DATA_DIR/.whitelist.XXXXXX")" || return 1
+    if ! python3 - "$dir/whitelist.json" "$staging" "$username" "$uuid" <<'PY'
+import json, sys
+source, staging, name, uid = sys.argv[1:]
+try:
+    with open(source, encoding="utf-8") as f:
+        entries = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    entries = []
+entries = [entry for entry in entries if entry.get("name", "").lower() != name.lower()]
+entries.append({"uuid": uid, "name": name})
+with open(staging, "w", encoding="utf-8") as f:
+    json.dump(entries, f, indent=2)
+    f.write("\n")
+PY
+    then
+        rm -f -- "$staging"
+        error "Could not update the whitelist file."
+        return 1
+    fi
+    chown "$SERVICE_USER:$SERVICE_GROUP" "$staging" 2>/dev/null || true
+    chmod 0644 "$staging"
+    mv -f -- "$staging" "$dir/whitelist.json"
+    info "Added '$username' to the whitelist."
+}
+
+whitelist_remove_offline() {
+    local name="$1" username="$2" dir result staging
+    dir="$(server_dir "$name")"
+    if service_active "$(server_unit "$name")"; then
+        send_command "$name" "whitelist remove $username" || return 1
+        for _ in {1..10}; do
+            if python3 - "$dir/whitelist.json" "$username" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        entries = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    entries = []
+sys.exit(0 if not any(e.get("name", "").lower() == sys.argv[2].lower() for e in entries) else 1)
+PY
+            then
+                info "Removed '$username' from the whitelist."
+                return 0
+            fi
+            sleep 1
+        done
+        error "The server did not confirm removal of '$username'. Check the server console and try again."
+        return 1
+    fi
+    staging="$(mktemp "$DATA_DIR/.whitelist.XXXXXX")" || return 1
+    if ! result="$(python3 - "$dir/whitelist.json" "$staging" "$username" <<'PY'
+import json, sys
+source, staging, name = sys.argv[1:]
+try:
+    with open(source, encoding="utf-8") as f:
+        entries = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    entries = []
+remaining = [entry for entry in entries if entry.get("name", "").lower() != name.lower()]
+with open(staging, "w", encoding="utf-8") as f:
+    json.dump(remaining, f, indent=2)
+    f.write("\n")
+print(len(entries) - len(remaining))
+PY
+    )"; then
+        rm -f -- "$staging"
+        error "Could not update the whitelist file."
+        return 1
+    fi
+    chown "$SERVICE_USER:$SERVICE_GROUP" "$staging" 2>/dev/null || true
+    chmod 0644 "$staging"
+    mv -f -- "$staging" "$dir/whitelist.json"
+    if [[ "$result" == "0" ]]; then
+        info "'$username' was not on the whitelist."
+    else
+        info "Removed '$username' from the whitelist."
+    fi
+}
+
+whitelist_list() {
+    local name="$1"
+    python3 - "$(server_dir "$name")/whitelist.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        entries = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    entries = []
+if not entries:
+    print("The whitelist is empty.")
+else:
+    for entry in entries:
+        print(entry.get("name", "Unknown"))
+PY
+}
+
+set_accessibility() {
+    local name="$1" access="$2" props enabled enabled_bool
+    props="$(server_dir "$name")/server.properties"
+    if [[ "$access" == "private" ]]; then enabled="true"; else enabled="false"; fi
+    set_property "$props" white-list "$enabled" "$SERVICE_USER:$SERVICE_GROUP" || return 1
+    set_property "$props" enforce-whitelist "$enabled" "$SERVICE_USER:$SERVICE_GROUP" || return 1
+    ACCESS="$access"
+    write_config "$name" || return 1
+    if service_active "$(server_unit "$name")"; then
+        if [[ "$enabled" == "true" ]]; then enabled_bool="on"; else enabled_bool="off"; fi
+        send_command "$name" "whitelist $enabled_bool" || return 1
+        info "Whitelist enabled: $enabled (applied immediately)."
+    else
+        info "Whitelist enabled: $enabled. It will apply when the server starts."
+    fi
+}
+
+manage_whitelist() {
+    local name="$1" choice username enabled
+    while true; do
+        printf '\ncraftd - whitelist: %s\n\n' "$name"
+        whitelist_list "$name"
+        printf '\n1. Add a username\n2. Remove a username\n3. Enable whitelist (private)\n4. Disable whitelist (public)\n0. Back\n\n'
+        read -r -p "Select an option: " choice || return 0
+        case "$choice" in
+            1)
+                read -r -p "Minecraft username: " username || continue
+                whitelist_add_offline "$name" "$username"
+                ;;
+            2)
+                read -r -p "Minecraft username to remove: " username || continue
+                [[ -n "$username" ]] && whitelist_remove_offline "$name" "$username"
+                ;;
+            3|4)
+                if [[ "$choice" == "3" ]]; then enabled="private"; else enabled="public"; fi
+                set_accessibility "$name" "$enabled"
+                ;;
+            0) return 0 ;;
+            *) warn "Choose an option from 0 to 4." ;;
+        esac
+    done
+}
+
+offer_restart() {
+    local name="$1" immediate="${2:-}"
+    if [[ "$immediate" == "immediate" ]]; then
+        info "Change applied immediately and saved for future restarts."
+    elif service_active "$(server_unit "$name")"; then
+        info "This change requires a restart to take full effect."
+        if confirm "Restart '$name' now?"; then
+            restart_server "$name"
+        else
+            info "The change was saved and will apply after the next restart."
+        fi
+    else
+        info "Change saved. It will apply when the server starts."
+    fi
+}
+
+change_port() {
+    local name="$1" value
+    read -r -p "Server port [$PORT]: " value || return 1
+    value="${value:-$PORT}"
+    if [[ "$value" == "$PORT" ]]; then
+        info "Port unchanged ($PORT)."
+        return 0
+    fi
+    if ! port_available "$value" "$name"; then
+        error "Port '$value' is unavailable. Choose an unused port from 1024 to 65535."
+        return 1
+    fi
+    set_property "$(server_dir "$name")/server.properties" server-port "$value" "$SERVICE_USER:$SERVICE_GROUP" || return 1
+    PORT="$value"
+    write_config "$name" || return 1
+    info "Port changed to $PORT."
+    offer_restart "$name"
+    if [[ "$STARTUP" == "automatic" ]] && ! service_active "$(server_unit "$name")"; then
+        systemctl restart "$(listener_unit "$name")" || return 1
+        info "The automatic listener now uses port $PORT."
+    fi
+}
+
+edit_properties() {
+    local name="$1" props choice value current bool key immediate=""
+    props="$(server_dir "$name")/server.properties"
+    while true; do
+        printf '\ncraftd - advanced options: %s\n\n' "$name"
+        printf 'Gamemode: %s | Difficulty: %s | Max players: %s | PvP: %s | Nether: %s\n' \
+            "$(get_property "$props" gamemode || printf '?')" \
+            "$(get_property "$props" difficulty || printf '?')" \
+            "$(get_property "$props" max-players || printf '?')" \
+            "$(get_property "$props" pvp || printf '?')" \
+            "$(get_property "$props" allow-nether || printf '?')"
+        printf 'View distance: %s | Simulation distance: %s | Online mode: %s\n\n' \
+            "$(get_property "$props" view-distance || printf '?')" \
+            "$(get_property "$props" simulation-distance || printf '?')" \
+            "$(get_property "$props" online-mode || printf '?')"
+        cat <<'MENU'
+1. Gamemode
+2. Difficulty
+3. Maximum players
+4. PvP
+5. Nether
+6. View distance
+7. Simulation distance
+8. Server message
+9. Online mode
+10. Server port
+11. Edit another server.properties setting
+0. Back
+
+MENU
+        read -r -p "Select an option: " choice || return 0
+        immediate=""
+        case "$choice" in
+            1)
+                read -r -p "Gamemode [survival/creative/adventure/spectator]: " value || continue
+                value="${value,,}"
+                [[ "$value" =~ ^(survival|creative|adventure|spectator)$ ]] || { warn "Invalid gamemode."; continue; }
+                key="gamemode"
+                ;;
+            2)
+                read -r -p "Difficulty [peaceful/easy/normal/hard]: " value || continue
+                value="${value,,}"
+                [[ "$value" =~ ^(peaceful|easy|normal|hard)$ ]] || { warn "Invalid difficulty."; continue; }
+                key="difficulty"
+                immediate="immediate"
+                ;;
+            3)
+                read -r -p "Maximum players [20]: " value || continue
+                value="${value:-20}"
+                [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le 2147483647 ]] || { warn "Enter a positive number."; continue; }
+                key="max-players"
+                ;;
+            4|5)
+                current="true"; [[ "$choice" == "5" ]] && current="$(get_property "$props" allow-nether || printf 'true')"
+                if [[ "$choice" == "4" ]]; then
+                    ask_yes_no "Enable PvP? [Y/n]: " "y" && bool=true || bool=false
+                    key="pvp"
+                else
+                    ask_yes_no "Enable the Nether? [Y/n]: " "y" && bool=true || bool=false
+                    key="allow-nether"
+                fi
+                value="$bool"
+                ;;
+            6)
+                read -r -p "View distance [10]: " value || continue
+                value="${value:-10}"
+                [[ "$value" =~ ^[0-9]+$ && "$value" -ge 3 && "$value" -le 32 ]] || { warn "Choose a value from 3 to 32."; continue; }
+                key="view-distance"
+                ;;
+            7)
+                read -r -p "Simulation distance [10]: " value || continue
+                value="${value:-10}"
+                [[ "$value" =~ ^[0-9]+$ && "$value" -ge 3 && "$value" -le 32 ]] || { warn "Choose a value from 3 to 32."; continue; }
+                key="simulation-distance"
+                ;;
+            8)
+                read -r -p "Server message: " value || continue
+                [[ -n "$value" && "$value" != *$'\n'* ]] || { warn "The server message cannot be empty."; continue; }
+                key="motd"
+                ;;
+            9)
+                info "Online mode verifies Minecraft accounts with Microsoft. Keep it enabled unless you understand the security risks."
+                warn "Changing online mode changes player UUIDs and may invalidate the existing whitelist and player data. Re-add players after the restart."
+                ask_yes_no "Enable online mode? [Y/n]: " "y" && bool=true || bool=false
+                value="$bool"
+                key="online-mode"
+                ;;
+            10)
+                change_port "$name"
+                continue
+                ;;
+            11)
+                read -r -p "Property name: " key || continue
+                [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] || { warn "Invalid property name."; continue; }
+                [[ "$key" != "server-port" ]] || { warn "Use option 10 to change the port safely."; continue; }
+                [[ "$key" != "white-list" && "$key" != "enforce-whitelist" ]] || { warn "Use the whitelist menu to change accessibility safely."; continue; }
+                current="$(get_property "$props" "$key" || true)"
+                read -r -p "Value for $key${current:+ [$current]}: " value || continue
+                value="${value:-$current}"
+                [[ "$value" != *$'\n'* ]] || { warn "Values must be one line."; continue; }
+                [[ "$key" == "level-seed" || "$key" == "level-type" || "$key" == "level-name" ]] && info "World-generation settings only affect a new world; your existing world is not regenerated."
+                ;;
+            0) return 0 ;;
+            *) warn "Choose an option from 0 to 11."; continue ;;
+        esac
+        set_property "$props" "$key" "$value" "$SERVICE_USER:$SERVICE_GROUP" || continue
+        info "Set $key=$value"
+        if [[ "$key" == "difficulty" ]] && service_active "$(server_unit "$name")"; then
+            send_command "$name" "difficulty $value" && offer_restart "$name" "immediate"
+        else
+            offer_restart "$name"
+        fi
+    done
+}
+
+restore_version_state() {
+    local name="$1" was_running="$2" was_waiting="$3"
+    rm -f -- "$CONFIG_DIR/$name.update"
+    if ((was_running)); then
+        start_server "$name"
+    elif ((was_waiting)); then
+        systemctl start "$(listener_unit "$name")"
+    fi
+}
+
+change_version() {
+    local name="$1" was_running=0 was_waiting=0 old_version new_java
+    load_config "$name"
+    old_version="$VERSION"
+    service_active "$(server_unit "$name")" && was_running=1
+    if ((!was_running)) && service_active "$(listener_unit "$name")"; then was_waiting=1; fi
+    info "Current Minecraft version: $old_version"
+    choose_version || return 1
+    if [[ "$SELECTED_VERSION" == "$old_version" ]]; then
+        info "The latest stable Paper build for $old_version will be installed."
+    fi
+    warn "Changing Minecraft versions can make a world incompatible with older versions. Plugins may also need updates."
+    confirm "Change '$name' from $old_version to $SELECTED_VERSION?" || { info "Version unchanged."; return 0; }
+    # This root-owned marker prevents automatic wake-ups throughout the version swap.
+    : >"$CONFIG_DIR/$name.update" || return 1
+    if ! systemctl stop "$(listener_unit "$name")"; then
+        restore_version_state "$name" "$was_running" "$was_waiting"
+        return 1
+    fi
+    if ((was_running)) && ! systemctl stop "$(server_unit "$name")"; then
+        error "Could not stop '$name'; version unchanged."
+        restore_version_state "$name" "$was_running" "$was_waiting"
+        return 1
+    fi
+    systemctl stop "$(listener_unit "$name")" >/dev/null 2>&1 || true
+    if ! ensure_java "$SELECTED_JAVA"; then
+        restore_version_state "$name" "$was_running" "$was_waiting"
+        return 1
+    fi
+    new_java="$FOUND_JAVA"
+    if ! download_paper "$name" "$SELECTED_VERSION"; then
+        restore_version_state "$name" "$was_running" "$was_waiting"
+        return 1
+    fi
+    VERSION="$SELECTED_VERSION"
+    BUILD="$DOWNLOAD_BUILD"
+    JAVA="$new_java"
+    JAVA_MIN="$SELECTED_JAVA"
+    if ! write_config "$name"; then
+        restore_version_state "$name" "$was_running" "$was_waiting"
+        return 1
+    fi
+    rm -f -- "$CONFIG_DIR/$name.update"
+    info "Minecraft version changed to $VERSION. World, plugins, logs and configuration were preserved."
+    if ((was_running)) || [[ "$STARTUP" == "always" ]]; then
+        start_server "$name"
+    elif ((was_waiting)); then
+        systemctl start "$(listener_unit "$name")"
+    fi
+}
+
+change_startup() {
+    local name="$1" choice
+    printf '\nStartup behaviour\n\n1. Manual - only start when requested\n2. Always on - start at boot and keep running\n3. Automatic - wake when someone tries to join\n0. Back\n\n'
+    read -r -p "Select an option [1-3]: " choice || return 0
+    case "$choice" in
+        1) STARTUP="manual" ;;
+        2) STARTUP="always" ;;
+        3) STARTUP="automatic" ;;
+        0|"") return 0 ;;
+        *) warn "Choose 1, 2 or 3."; return 1 ;;
+    esac
+    write_config "$name" || return 1
+    apply_startup "$name"
+}
+
+view_logs() {
+    local name="$1" log
+    validate_name "$name"
+    server_exists "$name" || die "Server '$name' does not exist."
+    log="$(server_dir "$name")/logs/latest.log"
+    if [[ ! -x "$(server_dir "$name")" ]]; then
+        error "The log is not readable by this user. Run: sudo craftd --logs $name"
+        return 1
+    fi
+    if [[ ! -f "$log" ]]; then
+        info "No log has been created yet. Start the server first, or check 'sudo systemctl status craftd@$name'."
+        return 0
+    fi
+    if [[ ! -r "$log" ]]; then
+        error "The log is not readable by this user. Run: sudo craftd --logs $name"
+        return 1
+    fi
+    if [[ -t 1 ]] && command -v less >/dev/null 2>&1; then
+        less +G "$log"
+    else
+        tail -n 250 "$log"
+    fi
+}
+
+view_console() {
+    local name="$1" log tail_pid command
+    log="$(server_dir "$name")/logs/latest.log"
+    service_active "$(server_unit "$name")" || die "Server '$name' is not running."
+    [[ "$EUID" -eq 0 ]] || die "Run the live console with sudo so console commands can be sent."
+    info "Live console for '$name'. Type Minecraft console commands below."
+    info "Press Ctrl+C to stop viewing; this will not stop the server."
+    touch "$log" 2>/dev/null || true
+    tail -n 30 -F "$log" &
+    tail_pid=$!
+    trap 'kill "$tail_pid" 2>/dev/null; trap - INT; return 0' INT
+    while IFS= read -r -p "> " command; do
+        [[ -n "$command" ]] && send_command "$name" "$command"
+        service_active "$(server_unit "$name")" || break
+    done
+    kill "$tail_pid" 2>/dev/null
+    trap - INT
+}
+
+delete_server() {
+    local name="$1" dir
+    require_root --delete "$name"
+    require_systemd
+    acquire_config_lock
+    load_config "$name"
+    dir="$(server_dir "$name")"
+    warn "This permanently deletes '$name' (Minecraft $VERSION), including its worlds, plugins, configuration and logs."
+    confirm "Delete server '$name' permanently?" || { info "Server '$name' was not deleted."; return 1; }
+    systemctl disable --now "$(listener_unit "$name")" >/dev/null 2>&1 || { error "Could not stop the listener. No server data was deleted."; return 1; }
+    STARTUP="manual"
+    write_config "$name" || return 1
+    systemctl stop "$(server_unit "$name")" || { error "Could not stop '$name'. No server data was deleted."; return 1; }
+    if service_active "$(server_unit "$name")" || service_active "$(listener_unit "$name")"; then
+        error "'$name' is still active. No server data was deleted."
+        return 1
+    fi
+    systemctl disable "$(server_unit "$name")" >/dev/null 2>&1 || { error "Could not disable '$name'. No server data was deleted."; return 1; }
+    rm -rf -- "$dir" || return 1
+    rm -f -- "$(config_file "$name")" || return 1
+    systemctl reset-failed "$(server_unit "$name")" "$(listener_unit "$name")" >/dev/null 2>&1 || true
+    info "Server '$name' deleted."
+}
+
+create_server() {
+    local name version java_min ram_default ram port choice gamemode difficulty access startup username dir props address
+    require_root --create
+    require_deps
+    require_systemd
+    acquire_config_lock
+    [[ -f /etc/systemd/system/craftd@.service ]] || die "craftd system services are not installed. Run the craftd installer first."
+    install -d -m 0755 "$SERVERS_DIR" "$CONFIG_DIR"
+    printf '\ncraftd - create a Paper server\n\n'
+    info "Press Enter to accept each displayed default."
+    while true; do
+        read -r -p "Server name: " name || return 1
+        name="${name,,}"
+        if ! valid_name "$name"; then
+            warn "Use 1-32 lowercase letters, numbers, '-' or '_', starting with a letter or number."
+        elif [[ -e "$(config_file "$name")" || -e "$(server_dir "$name")" ]]; then
+            warn "A server named '$name' already exists."
+        else
+            break
+        fi
+    done
+    choose_version || return 1
+    version="$SELECTED_VERSION"
+    java_min="$SELECTED_JAVA"
+    choose_from_menu "Gamemode" 1 "Survival" "Creative" "Adventure" "Spectator" || return 1
+    case "$SELECTED_OPTION" in
+        1) gamemode="survival" ;;
+        2) gamemode="creative" ;;
+        3) gamemode="adventure" ;;
+        4) gamemode="spectator" ;;
+    esac
+    choose_from_menu "Difficulty" 3 "Peaceful" "Easy" "Normal" "Hard" || return 1
+    case "$SELECTED_OPTION" in
+        1) difficulty="peaceful" ;;
+        2) difficulty="easy" ;;
+        3) difficulty="normal" ;;
+        4) difficulty="hard" ;;
+    esac
+    choose_from_menu "Accessibility" 1 \
+        "Private - only players on the whitelist can join" \
+        "Public - anyone with the server address can join" || return 1
+    if [[ "$SELECTED_OPTION" == "1" ]]; then access="private"; else access="public"; fi
+    choose_from_menu "Startup behaviour" 1 \
+        "Automatic - start when someone tries to join (recommended)" \
+        "Manual - only start when you ask" \
+        "Always on - start at boot and keep running" || return 1
+    case "$SELECTED_OPTION" in
+        1) startup="automatic" ;;
+        2) startup="manual" ;;
+        3) startup="always" ;;
+    esac
+    port="$(next_port)" || { error "No free server port could be found."; return 1; }
+    while true; do
+        read -r -p "Server port [$port]: " choice || return 1
+        choice="${choice:-$port}"
+        if port_available "$choice"; then port="$choice"; break; fi
+        warn "Choose an unused port from 1024 to 65535."
+    done
+    ram_default="$(default_memory)"
+    while true; do
+        read -r -p "Maximum RAM in MB [$ram_default]: " ram || return 1
+        ram="${ram:-$ram_default}"
+        [[ "$ram" =~ ^[0-9]+$ && "$ram" -ge 512 && "$ram" -le 1048576 ]] && break
+        warn "Enter a memory size of at least 512 MB."
+    done
+    username=""
+    if [[ "$access" == "private" ]]; then
+        read -r -p "Your Minecraft username for the whitelist (blank to add later): " username || return 1
+        if [[ -n "$username" && ! "$username" =~ ^[A-Za-z0-9_]{3,16}$ ]]; then
+            warn "Invalid username. You can add one later from 'sudo craftd --manage $name'."
+            username=""
+        fi
+    fi
+    printf '\nCreating %s: Minecraft %s on port %s with %s MB RAM.\n' "$name" "$version" "$port" "$ram"
+    info "Running a Minecraft server requires acceptance of the Minecraft EULA: https://aka.ms/MinecraftEULA"
+    confirm "Do you accept the Minecraft EULA?" || { info "No files were created."; return 1; }
+    ensure_java "$java_min" || return 1
+    dir="$(server_dir "$name")"
+    if ! install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$dir" "$dir/plugins" "$dir/logs"; then
+        rm -rf -- "$dir"
+        error "Could not create the server directory."
+        return 1
+    fi
+    if ! download_paper "$name" "$version"; then
+        rm -rf -- "$dir"
+        return 1
+    fi
+    props="$dir/server.properties"
+    cat >"$props" <<PROPERTIES
+#Minecraft server properties
+#Created by craftd
+allow-nether=true
+difficulty=$difficulty
+enable-command-block=false
+enforce-whitelist=$([[ "$access" == "private" ]] && printf true || printf false)
+gamemode=$gamemode
+generate-structures=true
+hardcore=false
+level-name=world
+level-seed=
+max-players=20
+motd=$name - PaperMC
+online-mode=true
+pvp=true
+server-ip=
+server-port=$port
+simulation-distance=10
+spawn-protection=16
+view-distance=10
+white-list=$([[ "$access" == "private" ]] && printf true || printf false)
+PROPERTIES
+    printf 'eula=true\n' >"$dir/eula.txt"
+    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$dir"
+    chmod 0644 "$props" "$dir/eula.txt"
+    NAME="$name" VERSION="$version" BUILD="$DOWNLOAD_BUILD" PORT="$port" MEMORY="$ram" STARTUP="$startup" ACCESS="$access" JAVA="$FOUND_JAVA" JAVA_MIN="$java_min"
+    if ! write_config "$name"; then
+        rm -rf -- "$dir"
+        error "Could not save the server configuration."
+        return 1
+    fi
+    if [[ -n "$username" ]]; then
+        whitelist_add_offline "$name" "$username" || warn "The server was created, but '$username' could not be added. Add it from 'sudo craftd --manage $name'."
+    fi
+    apply_startup "$name" || return 1
+    address="$(primary_ipv4)"
+    printf '\nServer '\''%s'\'' is ready.\n\n' "$name"
+    info "Address: $address:$PORT"
+    if [[ "$address" == "127.0.0.1" ]]; then
+        warn "No network address was detected, so players can only connect from this machine."
+    else
+        info "Players on the same network can connect with this address."
+        info "Players outside your network need TCP port $PORT forwarded and allowed through the firewall."
+    fi
+    case "$startup" in
+        manual) info "Start it with: sudo craftd --start $name" ;;
+        automatic) info "The server starts automatically when someone connects to that address." ;;
+    esac
+    info "To manage the server and advanced options, run: sudo craftd --manage $name"
+}
+
+print_summary() {
+    local show_status="${1:-status}" name status
+    local names=()
+    mapfile -t names < <(list_server_names)
+    if ((${#names[@]} == 0)); then
+        info "No servers configured. Create one with: sudo craftd --create"
+        return 0
+    fi
+    printf '%-20s %-9s %-12s %-7s %-9s %-10s\n' "SERVER" "STATUS" "VERSION" "PORT" "ACCESS" "STARTUP"
+    for name in "${names[@]}"; do
+        load_config "$name"
+        if [[ "$show_status" == "status" ]]; then status="$(service_status "$name")"; else status="-"; fi
+        printf '%-20s %-9s %-12s %-7s %-9s %-10s\n' "$NAME" "$status" "$VERSION" "$PORT" "${ACCESS^^}" "${STARTUP^^}"
+    done
+    info ""
+    info "STATUS: RUNNING = server active; WAITING = automatic listener active; STOPPED = inactive; FAILED = inspect logs."
+}
+
+manage_server() {
+    local name="$1" choice
+    require_root --manage "$name"
+    require_systemd
+    load_config "$name"
+    while true; do
+        load_config "$name"
+        printf '\ncraftd - manage: %s\n\n' "$name"
+        printf 'Server status: %s\n' "$(service_status "$name")"
+        printf 'Minecraft version: %s\n' "$VERSION"
+        printf 'Gamemode: %s\n' "$(get_property "$(server_dir "$name")/server.properties" gamemode || printf 'unknown')"
+        printf 'Address: %s:%s\n' "$(primary_ipv4)" "$PORT"
+        printf 'Accessibility: %s\n\n' "${ACCESS^^}"
+        cat <<'MENU'
+1. Start server
+2. Stop server
+3. Restart server
+4. View live console
+5. View logs
+6. Manage whitelist
+7. Advanced options
+8. Change server version
+9. Change startup behaviour
+10. Delete server
+0. Exit
+
+MENU
+        read -r -p "Select an option: " choice || return 0
+        case "$choice" in
+            1) start_server "$name" ;;
+            2) stop_server "$name" ;;
+            3) restart_server "$name" ;;
+            4) view_console "$name" ;;
+            5) view_logs "$name" ;;
+            6) manage_whitelist "$name" ;;
+            7) edit_properties "$name" ;;
+            8) change_version "$name" ;;
+            9) change_startup "$name" ;;
+            10) delete_server "$name" && return 0 ;;
+            0|"") return 0 ;;
+            *) warn "Choose an option from 0 to 10." ;;
+        esac
+    done
+}
+
+uninstall() {
+    local name created_user=0 primary_group choice
+    local names=()
+    require_root --uninstall
+    acquire_config_lock
+    printf '\ncraftd - uninstall\n\n'
+    warn "This will permanently remove:"
+    info "  * Every craftd Minecraft server, world, plugin, configuration and log in $DATA_DIR"
+    info "  * All craftd systemd services and the automatic connection listeners"
+    info "  * /usr/local/bin/craftd"
+    info "  * The dedicated 'craftd' system account, if it was created by the installer"
+    info ""
+    read -r -p "Type 'uninstall' to permanently delete all craftd data: " choice || { info "Uninstall cancelled."; return 1; }
+    [[ "$choice" == "uninstall" ]] || { info "Uninstall cancelled. No data was removed."; return 1; }
+    [[ -f "$DATA_DIR/.user-created" ]] && created_user=1
+    mapfile -t names < <(list_server_names)
+    for name in "${names[@]}"; do
+        info "Stopping and disabling '$name'..."
+        systemctl disable --now "$(listener_unit "$name")" >/dev/null 2>&1 || { error "Could not stop the listener for '$name'. No data was removed."; return 1; }
+        load_config "$name"
+        STARTUP="manual"
+        write_config "$name" || return 1
+        systemctl stop "$(server_unit "$name")" || { error "Could not stop '$name'. Uninstall aborted; server data was left in place."; return 1; }
+        if service_active "$(server_unit "$name")" || service_active "$(listener_unit "$name")"; then
+            error "'$name' did not stop completely. Uninstall aborted; no data was removed."
+            return 1
+        fi
+        systemctl disable "$(server_unit "$name")" >/dev/null 2>&1 || { error "Could not disable '$name'. Uninstall aborted."; return 1; }
+    done
+    for name in "${names[@]}"; do
+        systemctl reset-failed "$(server_unit "$name")" "$(listener_unit "$name")" >/dev/null 2>&1 || true
+    done
+    rm -f -- /etc/systemd/system/craftd@.service /etc/systemd/system/craftd-listener@.service
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf -- "$DATA_DIR" || return 1
+    rm -f -- /usr/local/bin/craftd || return 1
+    if ((created_user)) && getent passwd craftd >/dev/null; then
+        primary_group="$(id -gn craftd 2>/dev/null || true)"
+        userdel craftd 2>/dev/null || warn "Could not remove the craftd system account. Remove it manually with 'sudo userdel craftd'."
+        if [[ "$primary_group" == "craftd" ]] && getent group craftd >/dev/null; then
+            groupdel craftd 2>/dev/null || true
+        fi
+    elif getent passwd craftd >/dev/null; then
+        info "The pre-existing 'craftd' account was left unchanged."
+    fi
+    info "craftd and all server data were removed."
+}
+
+show_help() {
+    cat <<'HELP'
+craftd - simple PaperMC Minecraft server management
+
+Usage:
+  sudo craftd --create                  Create a server interactively
+  sudo craftd --manage <server-name>    Open the server management menu
+       craftd --list                    List configured servers and status
+  sudo craftd --start <server-name>     Start a server
+  sudo craftd --stop <server-name>      Stop a server cleanly
+  sudo craftd --restart <server-name>   Restart a server
+       craftd --status                  Show the status of all servers
+  sudo craftd --logs <server-name>      Display the latest server log
+  sudo craftd --delete <server-name>    Permanently delete a server after confirmation
+  sudo craftd --uninstall               Remove craftd, all servers and all server data
+       craftd --help                    Show this help
+
+Server data: /var/lib/craftd/servers
+Configuration: /var/lib/craftd/config
+
+Commands that manage or read server data need root; --list, --status and --help
+do not. Use sudo as shown above.
+Automatic mode listens for Minecraft connections and starts the server on demand;
+Always on starts the server at boot and keeps it running.
+HELP
+}
+
+main() {
+    local command="${1:---help}" name="${2:-}"
+    case "$command" in
+        --help|-h|help) show_help ;;
+        --create) [[ $# -eq 1 ]] || die "Usage: sudo craftd --create"; create_server ;;
+        --list|--status) [[ $# -eq 1 ]] || die "Usage: craftd $command"; print_summary status ;;
+        --manage|--start|--stop|--restart|--delete)
+            [[ $# -eq 2 && -n "$name" ]] || die "Usage: sudo craftd $command <server-name>"
+            case "$command" in
+                --manage) manage_server "$name" ;;
+                --start) start_server "$name" ;;
+                --stop) stop_server "$name" ;;
+                --restart) restart_server "$name" ;;
+                --delete) delete_server "$name" ;;
+            esac
+            ;;
+        --logs)
+            [[ $# -eq 2 && -n "$name" ]] || die "Usage: sudo craftd --logs <server-name>"
+            view_logs "$name"
+            ;;
+        --uninstall) [[ $# -eq 1 ]] || die "Usage: sudo craftd --uninstall"; uninstall ;;
+        --run)
+            [[ $# -eq 2 ]] || exit 2
+            run_server "$name"
+            ;;
+        --listen)
+            [[ $# -eq 2 ]] || exit 2
+            run_listener "$name"
+            ;;
+        --post-stop)
+            [[ $# -eq 2 || $# -eq 3 ]] || exit 2
+            resume_listener "$name" "${3:-success}"
+            ;;
+        *) error "Unknown command: $command"; info "Run 'craftd --help' for available commands."; exit 2 ;;
+    esac
+}
+
+main "$@"

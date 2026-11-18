@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Standalone installer for craftd. May be run from a checkout or through wget/curl.
+
+set -Eeuo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+readonly REPOSITORY="https://github.com/ferranox/craftd"
+readonly RAW_URL="https://raw.githubusercontent.com/ferranox/craftd/main/craftd"
+readonly DATA_DIR="/var/lib/craftd"
+
+TEMP_DIR=""
+FOUND_SOURCE=""
+cleanup() {
+    if [[ -n "$TEMP_DIR" ]]; then
+        rm -rf -- "$TEMP_DIR"
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+info() { printf '%s\n' "$*"; }
+error() { printf 'Error: %s\n' "$*" >&2; }
+die() { error "$*"; exit 1; }
+
+((EUID == 0)) || die "The installer needs root privileges. Run: sudo ./install"
+[[ "$(uname -s)" == "Linux" ]] || die "craftd only supports Linux."
+command -v systemctl >/dev/null 2>&1 || die "systemctl was not found. craftd currently requires systemd."
+[[ -d /run/systemd/system ]] || die "systemd is installed but is not running as the init system. Start the machine with systemd and run this installer again."
+systemctl list-unit-files >/dev/null 2>&1 || die "Could not communicate with systemd."
+
+detect_package_manager() {
+    local candidate
+    for candidate in apt-get dnf yum pacman apk; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    die "No supported package manager was found (apt, dnf, yum, pacman or apk). Install Bash, curl, Python 3 and the standard system tools, then try again."
+}
+
+install_packages() {
+    local manager="$1"
+    shift
+    (($#)) || return 0
+    info "Installing missing dependencies with $manager: $*"
+    case "$manager" in
+        apt-get)
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+            ;;
+        dnf) dnf install -y "$@" ;;
+        yum) yum install -y "$@" ;;
+        pacman) pacman -Sy --noconfirm --needed "$@" ;;
+        apk) apk add --no-cache "$@" ;;
+    esac
+}
+
+check_dependencies() {
+    local manager="$1" command_name package packages=()
+    local -A package_for=()
+    case "$manager" in
+        apt-get)
+            package_for=( [bash]=bash [curl]=curl [python3]=python3 [sha256sum]=coreutils [awk]=mawk [sed]=sed [tar]=tar [ss]=iproute2 [useradd]=passwd [flock]=util-linux )
+            ;;
+        dnf|yum)
+            package_for=( [bash]=bash [curl]=curl [python3]=python3 [sha256sum]=coreutils [awk]=gawk [sed]=sed [tar]=tar [ss]=iproute [useradd]=shadow-utils [flock]=util-linux )
+            ;;
+        pacman)
+            package_for=( [bash]=bash [curl]=curl [python3]=python [sha256sum]=coreutils [awk]=gawk [sed]=sed [tar]=tar [ss]=iproute2 [useradd]=shadow [flock]=util-linux )
+            ;;
+        apk)
+            package_for=( [bash]=bash [curl]=curl [python3]=python3 [sha256sum]=coreutils [awk]=awk [sed]=sed [tar]=tar [ss]=iproute2 [useradd]=shadow [flock]=util-linux )
+            ;;
+    esac
+    for command_name in bash curl python3 sha256sum awk sed tar ss useradd flock; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            package="${package_for[$command_name]}"
+            [[ " ${packages[*]:-} " == *" $package "* ]] || packages+=("$package")
+        fi
+    done
+    if [[ ! -r /etc/ssl/certs/ca-certificates.crt && ! -r /etc/ssl/cert.pem ]]; then
+        packages+=(ca-certificates)
+    fi
+    install_packages "$manager" "${packages[@]}"
+    for command_name in bash curl python3 sha256sum awk sed tar ss useradd flock; do
+        command -v "$command_name" >/dev/null 2>&1 || die "Required command '$command_name' is still missing after dependency installation."
+    done
+}
+
+source_executable() {
+    local script_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+    fi
+    if [[ -n "$script_dir" && -f "$script_dir/craftd" ]]; then
+        FOUND_SOURCE="$script_dir/craftd"
+        return 0
+    fi
+    TEMP_DIR="$(mktemp -d)"
+    info "Downloading the craftd executable..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fLsS --connect-timeout 15 --max-time 120 --retry 2 \
+            -A "craftd-installer ($REPOSITORY)" "$RAW_URL" -o "$TEMP_DIR/craftd"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=120 --tries=3 --user-agent="craftd-installer ($REPOSITORY)" \
+            -O "$TEMP_DIR/craftd" "$RAW_URL"
+    else
+        die "curl or wget is required for a remote installation."
+    fi
+    FOUND_SOURCE="$TEMP_DIR/craftd"
+}
+
+create_service_account() {
+    local nologin
+    if [[ -r /usr/sbin/nologin ]]; then
+        nologin=/usr/sbin/nologin
+    elif [[ -r /sbin/nologin ]]; then
+        nologin=/sbin/nologin
+    else
+        nologin=/bin/false
+    fi
+    if ! getent group craftd >/dev/null; then
+        groupadd --system craftd
+    fi
+    if ! getent passwd craftd >/dev/null; then
+        info "Creating the unprivileged 'craftd' system account..."
+        useradd --system --gid craftd --home-dir "$DATA_DIR" --no-create-home --shell "$nologin" craftd
+    fi
+    install -d -m 0755 -o root -g craftd "$DATA_DIR" "$DATA_DIR/servers"
+    install -d -m 0755 -o root -g craftd "$DATA_DIR/config" "$DATA_DIR/java"
+    if ((CREATED_USER)); then
+        touch "$DATA_DIR/.user-created"
+        chown root:craftd "$DATA_DIR/.user-created"
+        chmod 0644 "$DATA_DIR/.user-created"
+    fi
+}
+
+write_services() {
+    cat >/etc/systemd/system/craftd@.service <<'UNIT'
+[Unit]
+Description=craftd Minecraft server: %i
+Documentation=https://github.com/ferranox/craftd
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/craftd/servers/%i/server.jar
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=craftd
+Group=craftd
+WorkingDirectory=/var/lib/craftd/servers/%i
+ExecStart=/usr/local/bin/craftd --run %i
+ExecStopPost=+/usr/local/bin/craftd --post-stop %i ${SERVICE_RESULT}
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+SuccessExitStatus=0 143
+StandardOutput=journal
+StandardError=journal
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    cat >/etc/systemd/system/craftd-listener@.service <<'UNIT'
+[Unit]
+Description=craftd automatic connection listener: %i
+Documentation=https://github.com/ferranox/craftd
+After=network.target
+ConditionPathExists=/var/lib/craftd/servers/%i/server.jar
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/craftd --listen %i
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 /etc/systemd/system/craftd@.service /etc/systemd/system/craftd-listener@.service
+    systemctl daemon-reload
+}
+
+main() {
+    local manager source
+    printf '\ncraftd installer\n\n'
+    manager="$(detect_package_manager)"
+    info "Detected package manager: $manager"
+    check_dependencies "$manager"
+    source_executable
+    source="$FOUND_SOURCE"
+    [[ -s "$source" ]] || die "The craftd executable is empty or missing."
+    bash -n "$source" || die "The craftd executable failed its syntax check."
+
+    CREATED_USER=0
+    getent passwd craftd >/dev/null || CREATED_USER=1
+    create_service_account
+    write_services
+
+    install -m 0755 -o root -g root "$source" /usr/local/bin/craftd.new
+    mv -f /usr/local/bin/craftd.new /usr/local/bin/craftd
+    /usr/local/bin/craftd --help >/dev/null
+    systemctl cat craftd@.service >/dev/null
+    systemctl cat craftd-listener@.service >/dev/null
+
+    info ""
+    info "craftd was installed successfully."
+    info "Create your first server with: sudo craftd --create"
+    info "Java is installed automatically in the version required by the Minecraft version you select."
+}
+
+main "$@"
